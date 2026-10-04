@@ -61,12 +61,30 @@ jobs:
           $zip = "$env:TEMP\vbcable.zip"
           $dir = "$env:TEMP\vbcable"
 
-          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile $zip
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
+            -OutFile $zip -UserAgent "Mozilla/5.0" -MaximumRedirection 5
+
+          # Make sure we actually got a zip (a failed download often saves an HTML error page)
+          $size = (Get-Item $zip).Length
+          Write-Host "Downloaded $size bytes"
+          $magic = [System.IO.File]::ReadAllBytes($zip)[0..1]
+          if ($size -lt 100000 -or $magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) {
+              Get-Content $zip -TotalCount 20
+              throw "Download is not a valid zip. Check the filename at vb-audio.com/Cable"
+          }
+
           Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Write-Host "--- Extracted files ---"
+          Get-ChildItem $dir -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+
+          # Locate files wherever they ended up (the zip may use a subfolder)
+          $cat   = Get-ChildItem $dir -Recurse -Filter "*.cat"  | Where-Object { $_.Name -match "64" } | Select-Object -First 1
+          $setup = Get-ChildItem $dir -Recurse -Filter "VBCABLE_Setup_x64.exe" | Select-Object -First 1
+          $inf   = Get-ChildItem $dir -Recurse -Filter "*.inf"  | Where-Object { $_.Name -match "64" } | Select-Object -First 1
+          if (-not $cat -or -not $setup) { throw "Expected VB-Cable files not found. See file list above." }
 
           # Trust VB-Audio's signing cert first so the driver installs silently
           # (otherwise Windows shows a "trust this publisher?" prompt nobody can click)
-          $cat  = Get-ChildItem $dir -Filter "*cable64_win10.cat" | Select-Object -First 1
           $cert = (Get-AuthenticodeSignature $cat.FullName).SignerCertificate
           $cer  = "$env:TEMP\vbaudio.cer"
           Export-Certificate -Cert $cert -FilePath $cer | Out-Null
@@ -74,11 +92,11 @@ jobs:
           Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
 
           # Silent install (-i install, -h hide UI)
-          Start-Process "$dir\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait
+          Start-Process $setup.FullName -ArgumentList "-i","-h" -Wait -WorkingDirectory $setup.DirectoryName
 
           # Fallback: install the driver package directly if the installer didn't register it
           if (-not (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*" })) {
-              pnputil /add-driver "$dir\vbMmeCable64_win10.inf" /install
+              if ($inf) { pnputil /add-driver $inf.FullName /install }
           }
 
           # GitHub runners have no sound hardware, so the audio stack may be stopped/disabled
