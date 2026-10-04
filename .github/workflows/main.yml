@@ -18,14 +18,12 @@ jobs:
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
-
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
+
           # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
-
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
@@ -49,19 +47,91 @@ jobs:
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
+
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
+          }
+
+      - name: Install VB-Cable (virtual audio driver)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "$env:TEMP\vbcable.zip"
+          $dir = "$env:TEMP\vbcable"
+
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          # Trust VB-Audio's signing cert first so the driver installs silently
+          # (otherwise Windows shows a "trust this publisher?" prompt nobody can click)
+          $cat  = Get-ChildItem $dir -Filter "*cable64_win10.cat" | Select-Object -First 1
+          $cert = (Get-AuthenticodeSignature $cat.FullName).SignerCertificate
+          $cer  = "$env:TEMP\vbaudio.cer"
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+
+          # Silent install (-i install, -h hide UI)
+          Start-Process "$dir\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait
+
+          # Fallback: install the driver package directly if the installer didn't register it
+          if (-not (Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*" })) {
+              pnputil /add-driver "$dir\vbMmeCable64_win10.inf" /install
+          }
+
+          # GitHub runners have no sound hardware, so the audio stack may be stopped/disabled
+          foreach ($svc in "AudioEndpointBuilder","Audiosrv") {
+              Set-Service -Name $svc -StartupType Automatic
+              Start-Service -Name $svc -ErrorAction SilentlyContinue
+          }
+          Restart-Service Audiosrv -Force
+          Start-Sleep -Seconds 5
+
+          # Verify
+          Get-PnpDevice -Class MEDIA, AudioEndpoint -ErrorAction SilentlyContinue |
+            Where-Object { $_.FriendlyName -match "CABLE|VB-Audio" } |
+            Format-Table FriendlyName, Status -AutoSize
+          if (-not (Get-CimInstance Win32_SoundDevice | Where-Object { $_.Name -match "VB-Audio|CABLE" })) {
+              Write-Warning "VB-Cable device not detected"
+          }
+
+      - name: Install Zoom Workplace and OBS Studio
+        run: |
+          # Chocolatey is preinstalled on GitHub Windows runners.
+          # Both are machine-wide installs, so the RDP user will see them on first login.
+          choco install zoom obs-studio -y --no-progress --limit-output
+          if ($LASTEXITCODE -notin 0, 1641, 3010) {
+              Write-Error "Chocolatey install failed with exit code $LASTEXITCODE"
+              exit 1
+          }
+
+          # Make sure shortcuts are on the shared desktop for every user
+          $public = "$env:PUBLIC\Desktop"
+          $shell  = New-Object -ComObject WScript.Shell
+          $targets = @{
+              "Zoom Workplace" = "$env:ProgramFiles\Zoom\bin\Zoom.exe"
+              "OBS Studio"     = "$env:ProgramFiles\obs-studio\bin\64bit\obs64.exe"
+          }
+          foreach ($name in $targets.Keys) {
+              $exe = $targets[$name]
+              if (Test-Path $exe) {
+                  $lnk = $shell.CreateShortcut("$public\$name.lnk")
+                  $lnk.TargetPath = $exe
+                  $lnk.WorkingDirectory = Split-Path $exe
+                  $lnk.Save()
+                  Write-Host "OK: $name -> $exe"
+              } else {
+                  Write-Warning "$name not found at $exe"
+              }
           }
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
@@ -70,7 +140,7 @@ jobs:
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
+
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
@@ -79,17 +149,16 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-
-                    if (-not $tsIP) {
+          if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
+
           # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
@@ -105,7 +174,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
-          
+
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
