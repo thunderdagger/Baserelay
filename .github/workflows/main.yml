@@ -115,11 +115,11 @@ jobs:
               Write-Warning "VB-Cable device not detected"
           }
 
-      - name: Install Zoom Workplace and OBS Studio
+      - name: Install OBS Studio
         run: |
           # Chocolatey is preinstalled on GitHub Windows runners.
-          # Both are machine-wide installs, so the RDP user will see them on first login.
-          choco install zoom obs-studio -y --no-progress --limit-output
+          # Machine-wide install, so the RDP user will see it on first login.
+          choco install obs-studio -y --no-progress --limit-output
           if ($LASTEXITCODE -notin 0, 1641, 3010) {
               Write-Error "Chocolatey install failed with exit code $LASTEXITCODE"
               exit 1
@@ -129,7 +129,6 @@ jobs:
           $public = "$env:PUBLIC\Desktop"
           $shell  = New-Object -ComObject WScript.Shell
           $targets = @{
-              "Zoom Workplace" = "$env:ProgramFiles\Zoom\bin\Zoom.exe"
               "OBS Studio"     = "$env:ProgramFiles\obs-studio\bin\64bit\obs64.exe"
           }
           foreach ($name in $targets.Keys) {
